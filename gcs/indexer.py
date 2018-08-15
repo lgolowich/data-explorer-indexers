@@ -38,12 +38,12 @@ def parse_args():
     return parser.parse_args()
 
 
-def _append_to_file_sets(file_sets, primary_key, file_type, path):
-    if primary_key not in file_sets:
-        file_sets[primary_key] = {}
-    if file_type not in file_sets[primary_key]:
-        file_sets[primary_key][file_type] = {'files': []}
-    file_sets[primary_key][file_type]['files'].append(path)
+def _append_to_docs(docs, primary_key, file_type, path):
+    if primary_key not in docs:
+        docs[primary_key] = {'files': {}}
+    if file_type not in docs[primary_key]['files']:
+        docs[primary_key]['files'][file_type] = []
+    docs[primary_key]['files'][file_type].append(path)
 
 
 def index_gcs_files(es, index_name, gcs_pattern):
@@ -67,13 +67,15 @@ def index_gcs_files(es, index_name, gcs_pattern):
     # Group each object by primary key and file type, e.g.
     # {
     #   'PRIMARY_KEY1' : {
-    #       'bam': {
-    #           'count': 2,
-    #           'files': ['gs://b/file1.bam', 'gs://b/file2.bam'],
-    #       'vcf', {...}
-    #   }, ...
+    #       'files': {
+    #           'bam': ['gs://b/file1.bam', 'gs://b/file2.bam'],
+    #           'vcf': ['gs://b/file1.vcf', 'gs://b/file2.vcf'],
+    #           ...
+    #       }
+    #       ...
+    #   }
     # }
-    file_sets = {}
+    docs = {}
     for obj in objects:
         path = 'gs://%s/%s' % (bucket_str, obj.name)
         match = re.match(regex, path)
@@ -86,9 +88,9 @@ def index_gcs_files(es, index_name, gcs_pattern):
                 file_type = t
         if not file_type:
             continue
-        _append_to_file_sets(file_sets, primary_key, file_type, path)
+        _append_to_docs(docs, primary_key, file_type, path)
 
-    indexer_util.bulk_index(es, index_name, file_sets.iteritems())
+    indexer_util.bulk_index(es, index_name, docs.iteritems())
 
 
 def main():
