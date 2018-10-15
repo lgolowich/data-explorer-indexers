@@ -4,6 +4,8 @@ import json
 import logging
 import os
 import time
+from collections import OrderedDict
+
 from elasticsearch_dsl import Search
 from google.cloud import bigquery
 from google.cloud import exceptions
@@ -245,7 +247,7 @@ def read_table(client, table_name):
         client.dataset(dataset_id, project=project_id).table(table_name))
 
 
-def create_samples_json_export_file(es, index_name, deploy_project_id):
+def create_samples_json_export_file(es, index_name, table_columns, deploy_project_id):
     """
     Writes the samples export JSON file to a GCS bucket. This significantly
     speeds up exporting the samples table to Terra in the Data Explorer.
@@ -262,7 +264,7 @@ def create_samples_json_export_file(es, index_name, deploy_project_id):
         doc = hit.to_dict()
         for sample in doc.get('samples', []):
             sample_id = sample['sample_id']
-            export_sample = {'participant': participant_id}
+            sample_export = {}
             for es_field_name, value in sample.iteritems():
                 # es_field_name looks like "_has_chr_18_vcf", "sample_id" or
                 # "verily-public-data.human_genome_variants.1000_genomes_sample_info.In_Low_Coverage_Pilot".
@@ -270,12 +272,17 @@ def create_samples_json_export_file(es, index_name, deploy_project_id):
                 # Ignore _has_* and sample_id fields.
                 if len(splits) != 4:
                     continue
-                export_sample[splits[3]] = value
+                sample_export[splits[3]] = value
+
+            ordered_export = OrderedDict({'participant': participant_id})
+            for column in table_columns:
+                if column in sample_export:
+                    ordered_export[column] = sample_export[column]
 
             entities.append({
                 'entityType': 'sample',
                 'name': sample_id,
-                'attributes': export_sample,
+                'attributes': ordered_export,
             })
 
     client = storage.Client(project=deploy_project_id)
@@ -310,15 +317,18 @@ def main():
     sample_file_columns = bigquery_config.get('sample_file_columns', {})
     client = bigquery.Client(project=args.billing_project_id)
 
+    table_columns = []
     for table_name in bigquery_config['table_names']:
         table = read_table(client, table_name)
         index_table(es, index_name, client, table, participant_id_column,
                     sample_id_column, sample_file_columns)
         index_fields(es, index_name + '_fields', table, sample_id_column)
+        table_columns.extend([field.name for field in table.schema])
 
+    logger.info('TABLE COLUMNS: %s' % table_columns)
     if os.path.exists(deploy_config_path):
         deploy_config = indexer_util.parse_json_file(deploy_config_path)
-        create_samples_json_export_file(es, index_name,
+        create_samples_json_export_file(es, index_name, table_columns,
                                         deploy_config['project_id'])
 
 
