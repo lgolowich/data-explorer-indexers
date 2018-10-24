@@ -3,7 +3,7 @@ import argparse
 import json
 import logging
 import os
-import pandas as pd
+import pandas_gbq
 import time
 from elasticsearch_dsl import Search
 from google.cloud import bigquery
@@ -81,7 +81,7 @@ def _get_nested_mappings(schema, prefix=None):
     return nested if nested else None
 
 
-def _table_name_from_table(table):
+def _fully_qualified_table_name_from_table(table):
     # table.full_table_id is the legacy format: project id:dataset id.table name
     # Convert to Standard SQL format: project id.dataset id.table name
     # Use rsplit instead of split because project id may have ":", eg
@@ -94,7 +94,8 @@ def _create_nested_mappings(es, index_name, table, sample_id_column):
     # Create nested mappings for repeated record type BigQuery fields so that
     # queries will work correctly, see:
     # https://www.elastic.co/guide/en/elasticsearch/reference/6.4/nested.html#_how_arrays_of_objects_are_flattened
-    nested = _get_nested_mappings(table.schema, _table_name_from_table(table))
+    nested = _get_nested_mappings(
+        table.schema, _fully_qualified_table_name_from_table(table))
     # If the table contains the sample ID column, add a nested samples mapping.
     if sample_id_column in [f.name for f in table.schema]:
         logger.info('Adding nested sample mapping to %s.' % index_name)
@@ -109,7 +110,45 @@ def _create_nested_mappings(es, index_name, table, sample_id_column):
             doc_type='type', index=index_name, body={'properties': nested})
 
 
-def _docs_by_id(df, table_name, participant_id_column):
+def _table_to_df(
+        full_table_name,
+        deploy_project_id,
+):
+    # Use resplit() because project may have '.'
+    table_name = full_table_name.rsplit('.', 1)[1]
+    start_time = time.time()
+    import pdb
+    #    pdb.set_trace()
+    # TODO: After pandas 0.24.0 is released, switch to pd.read_gbq().
+    # 0.24.0 includes #21628 which passes configuration to pandas_gbq.
+    df = pandas_gbq.read_gbq(
+        'SELECT * FROM `%s`' % full_table_name,
+        project_id=deploy_project_id,
+        # TODO: Delete after 'standard' is the default
+        # https://github.com/pydata/pandas-gbq/issues/195
+        dialect='standard',
+        # Some BigQuery tables exceed the maximum response size of 128 MB
+        # (https://cloud.google.com/bigquery/quotas#queries). For those tables,
+        # we must write the query results to a destination table
+        # (https://cloud.google.com/bigquery/docs/writing-results#large-results)
+        # See https://github.com/pydata/pandas-gbq/issues/15#issuecomment-348241754
+        configuration={
+            'query': {
+                'destinationTable': {
+                    'projectId': deploy_project_id,
+                    'datasetId': 'tmp_destination_dataset',
+                    'tableId': 'tmp_destination_%s' % table_name,
+                }
+            }
+        })
+    elapsed_time = time.time() - start_time
+    elapsed_time_str = time.strftime('%Hh:%Mm:%Ss', time.gmtime(elapsed_time))
+    logger.info('BigQuery -> pandas took %s' % elapsed_time_str)
+    logger.info('%s has %d rows' % (full_table_name, len(df)))
+    return df
+
+
+def _docs_by_id(df, full_table_name, participant_id_column):
     for _, row in df.iterrows():
         # Remove nan's as described in
         # https://stackoverflow.com/questions/40363926/how-do-i-convert-my-dataframe-into-a-dictionary-while-ignoring-the-nan-values
@@ -117,7 +156,10 @@ def _docs_by_id(df, table_name, participant_id_column):
         row_dict = row.dropna().to_dict()
         # Remove the participant_id_column since it is stored as document id.
         del row_dict[participant_id_column]
-        row_dict = {table_name + '.' + k: v for k, v in row_dict.iteritems()}
+        row_dict = {
+            full_table_name + '.' + k: v
+            for k, v in row_dict.iteritems()
+        }
         yield row[participant_id_column], row_dict
 
 
@@ -164,7 +206,7 @@ def _field_docs_by_id(id_prefix, name_prefix, fields):
 # In order to keep the center field, one must use a script. See
 # https://discuss.elastic.co/t/updating-nested-objects/87586/2 and
 # https://www.elastic.co/guide/en/elasticsearch/reference/6.4/docs-update.html
-def _sample_scripts_by_id(df, table_name, participant_id_column,
+def _sample_scripts_by_id(df, full_table_name, participant_id_column,
                           sample_id_column, sample_file_columns):
     for _, row in df.iterrows():
         # Remove nan's as described in
@@ -175,7 +217,7 @@ def _sample_scripts_by_id(df, table_name, participant_id_column,
         del row_dict[participant_id_column]
         # Use the sample_id_column without the project_id + dataset qualification.
         row_dict = {
-            table_name + '.' + k if k != sample_id_column else k: v
+            full_table_name + '.' + k if k != sample_id_column else k: v
             for k, v in row_dict.iteritems()
         }
 
@@ -184,7 +226,7 @@ def _sample_scripts_by_id(df, table_name, participant_id_column,
         for file_type, col in sample_file_columns.iteritems():
             # Only mark as false if this sample file column is relevant to the
             # table currently being indexed.
-            if table_name in col:
+            if full_table_name in col:
                 has_name = '_has_%s' % file_type.lower().replace(" ", "_")
                 if col in row_dict and row_dict[col]:
                     row_dict[has_name] = True
@@ -202,35 +244,31 @@ def _sample_scripts_by_id(df, table_name, participant_id_column,
 
 
 def index_table(es, index_name, client, table, participant_id_column,
-                sample_id_column, sample_file_columns, deploy_project_id):
+                sample_id_column, sample_file_columns, billing_project_id,
+                deploy_project_id):
+    full_table_name = _fully_qualified_table_name_from_table(table)
+    logger.info('Indexing %s into %s.' % (full_table_name, index_name))
+
     _create_nested_mappings(es, index_name, table, sample_id_column)
-    table_name = _table_name_from_table(table)
-    start_time = time.time()
-    logger.info('Indexing %s into %s.' % (table_name, index_name))
 
     # There is no easy way to import BigQuery -> Elasticsearch. Instead:
     # BigQuery table -> pandas dataframe -> dict -> Elasticsearch
-    df = pd.read_gbq(
-        'SELECT * FROM `%s`' % table_name,
-        project_id=deploy_project_id,
-        dialect='standard')
-    elapsed_time = time.time() - start_time
-    elapsed_time_str = time.strftime('%Hh:%Mm:%Ss', time.gmtime(elapsed_time))
-    logger.info('BigQuery -> pandas took %s' % elapsed_time_str)
-    logger.info('%s has %d rows' % (table_name, len(df)))
+    df = _table_to_df(full_table_name, billing_project_id, deploy_project_id)
 
     if not participant_id_column in df.columns:
         raise ValueError(
             'Participant ID column %s not found in BigQuery table %s' %
-            (participant_id_column, table_name))
+            (participant_id_column, full_table_name))
+
+    start_time = time.time()
 
     if sample_id_column in df.columns:
         scripts_by_id = _sample_scripts_by_id(
-            df, table_name, participant_id_column, sample_id_column,
+            df, full_table_name, participant_id_column, sample_id_column,
             sample_file_columns)
         indexer_util.bulk_index_scripts(es, index_name, scripts_by_id)
     else:
-        docs_by_id = _docs_by_id(df, table_name, participant_id_column)
+        docs_by_id = _docs_by_id(df, full_table_name, participant_id_column)
         indexer_util.bulk_index_docs(es, index_name, docs_by_id)
 
     elapsed_time = time.time() - start_time
@@ -239,10 +277,10 @@ def index_table(es, index_name, client, table, participant_id_column,
 
 
 def index_fields(es, index_name, table, sample_id_column):
-    table_name = _table_name_from_table(table)
-    logger.info('Indexing %s into %s.' % (table_name, index_name))
+    full_table_name = _fully_qualified_table_name_from_table(table)
+    logger.info('Indexing %s into %s.' % (full_table_name, index_name))
 
-    id_prefix = table_name
+    id_prefix = full_table_name
     fields = table.schema
     # If the table contains the sample_id_columnm, prefix the elasticsearch Name
     # of the fields in this table with "samples."
@@ -253,14 +291,6 @@ def index_fields(es, index_name, table, sample_id_column):
 
     field_docs = _field_docs_by_id(id_prefix, '', fields)
     indexer_util.bulk_index_docs(es, index_name, field_docs)
-
-
-def read_table(client, table_name):
-    # Use rsplit instead of split because project id may have ".", eg
-    # "google.com:api-project-123".
-    project_id, dataset_id, table_name = table_name.rsplit('.', 2)
-    return client.get_table(
-        client.dataset(dataset_id, project=project_id).table(table_name))
 
 
 def create_samples_json_export_file(es, index_name, deploy_project_id):
@@ -332,8 +362,12 @@ def main():
     sample_file_columns = bigquery_config.get('sample_file_columns', {})
     client = bigquery.Client(project=deploy_project_id)
 
-    for table_name in bigquery_config['table_names']:
-        table = read_table(client, table_name)
+    for full_table_name in bigquery_config['table_names']:
+        # Use rsplit instead of split because project id may have ".", eg
+        # "google.com:api-project-123".
+        project_id, dataset_id, table_name = full_table_name.rsplit('.', 2)
+        table = client.get_table(
+            client.dataset(dataset_id, project=project_id).table(table_name))
         index_table(es, index_name, client, table, participant_id_column,
                     sample_id_column, sample_file_columns, deploy_project_id)
         index_fields(es, index_name + '_fields', table, sample_id_column)

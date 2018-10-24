@@ -11,6 +11,8 @@ services:
       # deployments.
       - "transport.host=localhost"
   indexer:
+    stdin_open: true
+    tty: true
     build:
       # Context is project root, to pick up indexer_util and dataset_config
       context: ../
