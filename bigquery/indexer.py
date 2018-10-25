@@ -5,6 +5,8 @@ import logging
 import os
 import pandas as pd
 import time
+from multiprocessing import Pool
+
 from elasticsearch_dsl import Search
 from google.cloud import bigquery
 from google.cloud import exceptions
@@ -201,28 +203,16 @@ def _sample_scripts_by_id(df, table_name, participant_id_column,
         }
 
 
-def index_table(es, index_name, client, table, participant_id_column,
-                sample_id_column, sample_file_columns, deploy_project_id):
-    _create_nested_mappings(es, index_name, table, sample_id_column)
-    table_name = _table_name_from_table(table)
-    start_time = time.time()
-    logger.info('Indexing %s into %s.' % (table_name, index_name))
-
-    # There is no easy way to import BigQuery -> Elasticsearch. Instead:
-    # BigQuery table -> pandas dataframe -> dict -> Elasticsearch
+def _index_table(es, index_name, client, table, participant_id_column,
+                sample_id_column, sample_file_columns, deploy_project_id,
+                table_name, chunk_size, offset):
+    logger.info('Indexing %s into %s offset: %d.' % (table_name, index_name, offset))
+    sql = 'SELECT * FROM `%s` ORDER BY %s LIMIT %d OFFSET %d' % (
+        table_name, participant_id_column, chunk_size, offset)
     df = pd.read_gbq(
-        'SELECT * FROM `%s`' % table_name,
+        sql,
         project_id=deploy_project_id,
         dialect='standard')
-    elapsed_time = time.time() - start_time
-    elapsed_time_str = time.strftime('%Hh:%Mm:%Ss', time.gmtime(elapsed_time))
-    logger.info('BigQuery -> pandas took %s' % elapsed_time_str)
-    logger.info('%s has %d rows' % (table_name, len(df)))
-
-    if not participant_id_column in df.columns:
-        raise ValueError(
-            'Participant ID column %s not found in BigQuery table %s' %
-            (participant_id_column, table_name))
 
     if sample_id_column in df.columns:
         scripts_by_id = _sample_scripts_by_id(
@@ -233,9 +223,30 @@ def index_table(es, index_name, client, table, participant_id_column,
         docs_by_id = _docs_by_id(df, table_name, participant_id_column)
         indexer_util.bulk_index_docs(es, index_name, docs_by_id)
 
+
+def index_table(es, index_name, client, table, participant_id_column,
+                sample_id_column, sample_file_columns, deploy_project_id):
+    _create_nested_mappings(es, index_name, table, sample_id_column)
+    table_name = _table_name_from_table(table)
+    start_time = time.time()
+    logger.info('Indexing %s into %s.' % (table_name, index_name))
+
+    sql = 'SELECT COUNT(%s) from `%s`' % (participant_id_column, table_name)
+    df = pd.read_gbq(sql, project_id=deploy_project_id, dialect='standard')
+    total_rows = df.to_dict()['f0_'].get(0)
+    logger.info('TOTAL ROWS: %s' % total_rows)
+
+    # There is no easy way to import BigQuery -> Elasticsearch. Instead:
+    # BigQuery table -> pandas dataframe -> dict -> Elasticsearch
+    chunk_size = 100
+    offset = 0
+    while offset + chunk_size < total_rows:
+        _index_table(es, index_name, client, table, participant_id_column, sample_id_column, sample_file_columns, deploy_project_id, table_name, chunk_size, offset)
+        offset += chunk_size
+
     elapsed_time = time.time() - start_time
     elapsed_time_str = time.strftime("%Hh:%Mm:%Ss", time.gmtime(elapsed_time))
-    logger.info('pandas -> ElasticSearch index took %s' % elapsed_time_str)
+    logger.info('BigQuery -> ElasticSearch index took %s' % elapsed_time_str)
 
 
 def index_fields(es, index_name, table, sample_id_column):

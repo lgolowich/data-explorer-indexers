@@ -100,7 +100,14 @@ def maybe_create_elasticsearch_index(elasticsearch_url, index_name):
     else:
         logger.info(
             'Creating %s index at %s.' % (index_name, elasticsearch_url))
-        es.indices.create(index=index_name, body={})
+        es.indices.create(
+            index=index_name,
+            body={
+                "settings": {
+                    # Default of 1000 fields is not enough for some datasets
+                    "index.mapping.total_fields.limit": 10000,
+                }
+            })
     return es
 
 
