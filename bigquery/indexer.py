@@ -110,34 +110,46 @@ def _create_nested_mappings(es, index_name, table, sample_id_column):
             doc_type='type', index=index_name, body={'properties': nested})
 
 
-def _table_to_df(
-        full_table_name,
-        deploy_project_id,
-):
-    # Use resplit() because project may have '.'
+def _table_to_df(client, full_table_name, deploy_project_id):
+    # Use resplit() because project id may have '.'
     table_name = full_table_name.rsplit('.', 1)[1]
     start_time = time.time()
-    import pdb
-    #    pdb.set_trace()
+
+    # Some BigQuery tables exceed the maximum response size of 128 MB
+    # (https://cloud.google.com/bigquery/quotas#queries). For those tables,
+    # we must write the query results to a destination table
+    # (https://cloud.google.com/bigquery/docs/writing-results#large-results)
+    # See https://github.com/pydata/pandas-gbq/issues/15#issuecomment-348241754
+
+    # Create destination dataset if necessary.
+    dest_dataset_id = 'tmp_destination_dataset'
+    dest_table_name = 'tmp_destination_%s' % table_name
+    dataset_ref = client.dataset(dest_dataset_id, project=deploy_project_id)
+
+    def _dataset_exists():
+        try:
+            client.get_dataset(dataset_ref)
+            return True
+        except exceptions.NotFound:
+            return False
+
+    if not _dataset_exists():
+        client.create_dataset(bigquery.Dataset(dataset_ref))
+
     # TODO: After pandas 0.24.0 is released, switch to pd.read_gbq().
-    # 0.24.0 includes #21628 which passes configuration to pandas_gbq.
+    # 0.24.0 includes #21628 which passes configuration parameter to pandas_gbq.
     df = pandas_gbq.read_gbq(
         'SELECT * FROM `%s`' % full_table_name,
         project_id=deploy_project_id,
         # TODO: Delete after 'standard' is the default
         # https://github.com/pydata/pandas-gbq/issues/195
         dialect='standard',
-        # Some BigQuery tables exceed the maximum response size of 128 MB
-        # (https://cloud.google.com/bigquery/quotas#queries). For those tables,
-        # we must write the query results to a destination table
-        # (https://cloud.google.com/bigquery/docs/writing-results#large-results)
-        # See https://github.com/pydata/pandas-gbq/issues/15#issuecomment-348241754
         configuration={
             'query': {
                 'destinationTable': {
                     'projectId': deploy_project_id,
-                    'datasetId': 'tmp_destination_dataset',
-                    'tableId': 'tmp_destination_%s' % table_name,
+                    'datasetId': dest_dataset_id,
+                    'tableId': dest_table_name,
                 }
             }
         })
@@ -145,6 +157,10 @@ def _table_to_df(
     elapsed_time_str = time.strftime('%Hh:%Mm:%Ss', time.gmtime(elapsed_time))
     logger.info('BigQuery -> pandas took %s' % elapsed_time_str)
     logger.info('%s has %d rows' % (full_table_name, len(df)))
+
+    table_ref = dataset_ref.table(dest_table_name)
+    client.delete_table(table_ref)
+
     return df
 
 
@@ -244,8 +260,7 @@ def _sample_scripts_by_id(df, full_table_name, participant_id_column,
 
 
 def index_table(es, index_name, client, table, participant_id_column,
-                sample_id_column, sample_file_columns, billing_project_id,
-                deploy_project_id):
+                sample_id_column, sample_file_columns, deploy_project_id):
     full_table_name = _fully_qualified_table_name_from_table(table)
     logger.info('Indexing %s into %s.' % (full_table_name, index_name))
 
@@ -253,7 +268,7 @@ def index_table(es, index_name, client, table, participant_id_column,
 
     # There is no easy way to import BigQuery -> Elasticsearch. Instead:
     # BigQuery table -> pandas dataframe -> dict -> Elasticsearch
-    df = _table_to_df(full_table_name, billing_project_id, deploy_project_id)
+    df = _table_to_df(client, full_table_name, deploy_project_id)
 
     if not participant_id_column in df.columns:
         raise ValueError(
