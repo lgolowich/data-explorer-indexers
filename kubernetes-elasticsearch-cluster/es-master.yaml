@@ -1,11 +1,18 @@
 apiVersion: apps/v1beta1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: es-master
   labels:
     component: elasticsearch
     role: master
 spec:
+  updateStrategy:
+    type: RollingUpdate
+  selector:
+    matchLabels:
+      component: elasticsearch
+      role: master
+  serviceName: elasticsearch-master
   replicas: 3
   template:
     metadata:
@@ -61,10 +68,17 @@ spec:
         livenessProbe:
           tcpSocket:
             port: transport
+          initialDelaySeconds: 20
+          periodSeconds: 10
         volumeMounts:
         - name: storage
           mountPath: /data
-      volumes:
-          - emptyDir:
-              medium: ""
-            name: "storage"
+  volumeClaimTemplates:
+  - metadata:
+      name: storage
+    spec:
+      storageClassName: standard
+      accessModes: [ ReadWriteOnce ]
+      resources:
+        requests:
+          storage: 2Gi

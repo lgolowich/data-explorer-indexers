@@ -5,6 +5,9 @@ import logging
 import os
 import pandas as pd
 import time
+import uuid
+
+from apiclient.discovery import build
 from elasticsearch_dsl import Search
 from google.cloud import bigquery
 from google.cloud import exceptions
@@ -201,41 +204,95 @@ def _sample_scripts_by_id(df, table_name, participant_id_column,
         }
 
 
+def _docs_by_id_from_prefix(deploy_project_id, export_obj_prefix, table_name, participant_id_column):
+    client = storage.Client(project=deploy_project_id)
+    bucket = client.get_bucket('nhs-explorer-export')
+    for blob in bucket.list_blobs(prefix=export_obj_prefix):
+        logger.info('READ NEW BLOB')
+        json_text = blob.download_as_string()
+        for row in json_text.split('\n'):
+            # Ignore any blank lines
+            if not row:
+                continue
+
+            row_dict = json.loads(row)
+            participant_id = row_dict[participant_id_column]
+            del row_dict[participant_id_column]
+            row_dict = {'%s.%s' % (table_name, k): v for k, v in row_dict.iteritems()}
+            yield participant_id, row_dict
+
+
 def index_table(es, index_name, client, table, participant_id_column,
                 sample_id_column, sample_file_columns, deploy_project_id):
-    _create_nested_mappings(es, index_name, table, sample_id_column)
-    table_name = _table_name_from_table(table)
-    start_time = time.time()
-    logger.info('Indexing %s into %s.' % (table_name, index_name))
+    # bigquery_service = build('bigquery', 'v2')
+    # job_id = str(uuid.uuid4())
+    # export_obj_prefix = 'test-table-export-%s*.json' % job_id
+    # job = {
+    #     'jobReference': {
+    #         'projectId': deploy_project_id,
+    #         'jobId': job_id
+    #     },
+    #     'configuration': {
+    #         'extract': {
+    #             'sourceTable': {
+    #                 'projectId': table.project,
+    #                 'datasetId': table.dataset_id,
+    #                 'tableId': table.table_id,
+    #             },
+    #             'destinationUris': ['gs://nhs-explorer-export/%s' % export_obj_prefix],
+    #             'destinationFormat': 'NEWLINE_DELIMITED_JSON'
+    #         },
+    #     }
+    # }
+
+    # bigquery_service.jobs().insert(projectId=deploy_project_id, body=job).execute()
+    # done = False
+    # while not done:
+    #     resp = bigquery_service.jobs().get(projectId=deploy_project_id, jobId=job_id).execute()
+    #     logger.info('RESP: %s' % resp.get('status'))
+    #     done = resp.get('status', {}).get('state', '') == 'DONE'
+    #     time.sleep(5)
+
+    # logger.info('!!!export_obj_prefix: "%s"' % export_obj_prefix)
+    export_obj_prefix = 'test-table-export-4d7e8ccc-84d7-4154-b40c-c9cd2279e9f6'
+    indexer_util.bulk_index_docs(es, index_name, _docs_by_id_from_prefix(deploy_project_id, export_obj_prefix, '%s.%s.%s' % (table.project, table.dataset_id, table.table_id), participant_id_column))
+
+    return
+
+
+    # _create_nested_mappings(es, index_name, table, sample_id_column)
+    # table_name = _table_name_from_table(table)
+    # start_time = time.time()
+    # logger.info('Indexing %s into %s.' % (table_name, index_name))
 
     # There is no easy way to import BigQuery -> Elasticsearch. Instead:
     # BigQuery table -> pandas dataframe -> dict -> Elasticsearch
-    df = pd.read_gbq(
-        'SELECT * FROM `%s`' % table_name,
-        project_id=deploy_project_id,
-        dialect='standard')
-    elapsed_time = time.time() - start_time
-    elapsed_time_str = time.strftime('%Hh:%Mm:%Ss', time.gmtime(elapsed_time))
-    logger.info('BigQuery -> pandas took %s' % elapsed_time_str)
-    logger.info('%s has %d rows' % (table_name, len(df)))
+    # df = pd.read_gbq(
+    #     'SELECT * FROM `%s`' % table_name,
+    #     project_id=deploy_project_id,
+    #     dialect='standard')
+    # elapsed_time = time.time() - start_time
+    # elapsed_time_str = time.strftime('%Hh:%Mm:%Ss', time.gmtime(elapsed_time))
+    # logger.info('BigQuery -> pandas took %s' % elapsed_time_str)
+    # logger.info('%s has %d rows' % (table_name, len(df)))
 
-    if not participant_id_column in df.columns:
-        raise ValueError(
-            'Participant ID column %s not found in BigQuery table %s' %
-            (participant_id_column, table_name))
+    # if not participant_id_column in df.columns:
+    #     raise ValueError(
+    #         'Participant ID column %s not found in BigQuery table %s' %
+    #         (participant_id_column, table_name))
 
-    if sample_id_column in df.columns:
-        scripts_by_id = _sample_scripts_by_id(
-            df, table_name, participant_id_column, sample_id_column,
-            sample_file_columns)
-        indexer_util.bulk_index_scripts(es, index_name, scripts_by_id)
-    else:
-        docs_by_id = _docs_by_id(df, table_name, participant_id_column)
-        indexer_util.bulk_index_docs(es, index_name, docs_by_id)
+    # if sample_id_column in df.columns:
+    #     scripts_by_id = _sample_scripts_by_id(
+    #         df, table_name, participant_id_column, sample_id_column,
+    #         sample_file_columns)
+    #     indexer_util.bulk_index_scripts(es, index_name, scripts_by_id)
+    # else:
+    #     docs_by_id = _docs_by_id(df, table_name, participant_id_column)
+    #     indexer_util.bulk_index_docs(es, index_name, docs_by_id)
 
-    elapsed_time = time.time() - start_time
-    elapsed_time_str = time.strftime("%Hh:%Mm:%Ss", time.gmtime(elapsed_time))
-    logger.info('pandas -> ElasticSearch index took %s' % elapsed_time_str)
+    # elapsed_time = time.time() - start_time
+    # elapsed_time_str = time.strftime("%Hh:%Mm:%Ss", time.gmtime(elapsed_time))
+    # logger.info('pandas -> ElasticSearch index took %s' % elapsed_time_str)
 
 
 def index_fields(es, index_name, table, sample_id_column):
@@ -253,6 +310,66 @@ def index_fields(es, index_name, table, sample_id_column):
 
     field_docs = _field_docs_by_id(id_prefix, '', fields)
     indexer_util.bulk_index_docs(es, index_name, field_docs)
+
+
+def _get_es_field_type(bq_type, bq_mode):
+    if bq_type == 'STRING':
+        return 'text'
+    elif bq_type == 'INTEGER' or bq_type == 'INT64':
+        return 'long'
+    elif bq_type == 'FLOAT' or bq_type == 'FLOAT64':
+        return 'float'
+    elif bq_type == 'BOOLEAN' or bq_type == 'BOOL':
+        return 'boolean'
+    elif bq_type == 'TIMESTAMP' or bq_type == 'DATE' or bq_type == 'TIME' or bq_type == 'DATETIME':
+        return 'date'
+    elif bq_type == 'RECORD':
+        if bq_mode == 'REPEATED':
+            return 'nested'
+        return 'object'
+    else:
+        raise Exception('Invalid BigQuery column type')
+
+
+def _get_has_file_field_name(field_name, sample_file_columns):
+    for file_type, col in sample_file_columns.iteritems():
+        if field_name in col:
+            return '_has_%s' % file_type.lower().replace(" ", "_")
+    return ''
+
+
+def create_mappings(es, index_name, table_name, fields, sample_id_column, sample_file_columns):
+    mappings = {'dynamic': False, 'properties': {}}
+    properties = mappings['properties']
+    field_prefix = table_name
+    for field in fields:
+        if field.name == sample_id_column:
+            id_prefix = 'samples.%s' % field_prefix
+            properties['samples'] = {'type': 'nested', 'properties': {}}
+            properties = properties['samples']['properties']
+
+    for field in fields:
+        field_name = '%s.%s' % (field_prefix, field.name)
+        field_type = _get_es_field_type(field.field_type, field.mode)
+        properties[field_name] = {'type': field_type}
+
+        if field_type == 'nested' or field_type == 'object':
+            inner_mappings = create_mappings(es, index_name, field.fields, sample_id_column, sample_file_columns)
+            properties[field_name]['properties'] = inner_mappings['properties']
+        elif field_type == 'text':
+            properties[field_name]['fields'] = {
+                'keyword' : {
+                    'type': 'keyword',
+                    'ignore_above': 256
+                }
+            }
+
+        has_field_name = _get_has_file_field_name(field_name.replace('samples.', ''), sample_file_columns)
+        if has_field_name:
+            properties[has_field_name] = {'type': 'boolean'}
+
+    es.indices.put_mapping(
+        doc_type='type', index=index_name, body=mappings)
 
 
 def read_table(client, table_name):
@@ -334,9 +451,10 @@ def main():
 
     for table_name in bigquery_config['table_names']:
         table = read_table(client, table_name)
+        index_fields(es, index_name + '_fields', table, sample_id_column)
+        create_mappings(es, index_name, table_name, table.schema, sample_id_column, sample_file_columns)
         index_table(es, index_name, client, table, participant_id_column,
                     sample_id_column, sample_file_columns, deploy_project_id)
-        index_fields(es, index_name + '_fields', table, sample_id_column)
 
     # Ensure all of the newly indexed documents are loaded into ES.
     time.sleep(5)

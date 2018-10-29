@@ -8,7 +8,7 @@ import time
 
 from elasticsearch import Elasticsearch
 from elasticsearch.exceptions import ConnectionError
-from elasticsearch.helpers import bulk
+from elasticsearch.helpers import bulk, BulkIndexError
 
 # Log to stderr.
 logging.basicConfig(
@@ -90,7 +90,10 @@ def _wait_elasticsearch_healthy(es):
 
 def maybe_create_elasticsearch_index(elasticsearch_url, index_name):
     """Creates Elasticsearchindex if it doesn't already exist."""
-    es = Elasticsearch([elasticsearch_url])
+    es = Elasticsearch(
+        [elasticsearch_url],
+        retry_on_timeout=True,
+        max_retries=10)
 
     _wait_elasticsearch_healthy(es)
 
@@ -100,7 +103,15 @@ def maybe_create_elasticsearch_index(elasticsearch_url, index_name):
     else:
         logger.info(
             'Creating %s index at %s.' % (index_name, elasticsearch_url))
-        es.indices.create(index=index_name, body={})
+        es.indices.create(
+            index=index_name,
+            body={
+                'settings': {
+                    'number_of_shards': 5,
+                    # Default of 1000 fields is not enough for some datasets
+                    'index.mapping.total_fields.limit': 15000,
+                },
+            })
     return es
 
 
@@ -123,7 +134,7 @@ def bulk_index_scripts(es, index_name, scripts_by_id):
 
     # For writing large amounts of data, the default timeout of 10s is
     # sometimes not enough.
-    bulk(es, es_actions(scripts_by_id), request_timeout=60)
+    bulk(es, es_actions(scripts_by_id), request_timeout=120)
 
 
 def bulk_index_docs(es, index_name, docs_by_id):
@@ -142,6 +153,16 @@ def bulk_index_docs(es, index_name, docs_by_id):
                 'doc_as_upsert': True
             })
 
+    # # Update the settings to temporarily optimize for heavy-write performance.
+    es.indices.put_settings({
+        'index.refresh_interval': '-1', 
+        'index.number_of_replicas': 0,
+    })
     # For writing large amounts of data, the default timeout of 10s is
     # sometimes not enough.
-    bulk(es, es_actions(docs_by_id), request_timeout=60)
+    bulk(es, es_actions(docs_by_id), request_timeout=120)
+
+    es.indices.put_settings({
+        'index.refresh_interval': '1s',
+        'index.number_of_replicas': 1,
+    })
