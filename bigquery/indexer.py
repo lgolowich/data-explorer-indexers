@@ -41,15 +41,37 @@ if (!ctx._source.containsKey('samples')) {
 }
 """
 
+UPDATE_SAMPLES_TSV_SCRIPT = """
+if (!ctx._source.containsKey(params.tsv)) {
+   ctx._source.put(params.tsv, new HashMap());
+   ctx._source.get(params.tsv).samples = [params.sample]
+}
+else if (!ctx._source.get(params.tsv).containsKey('samples')) {
+   ctx._source.get(params.tsv).samples = [params.sample]
+} else {
+   // If this sample already exists, merge it with the new one.
+   int removeIdx = -1;
+   for (int i = 0; i < ctx._source.get(params.tsv).samples.size(); i++) {
+      if (ctx._source.get(params.tsv).samples.get(i).get('%s').equals(params.sample.get('%s'))) {
+         removeIdx = i;
+      }
+   }
+
+   if (removeIdx >= 0) {
+      Map merged = ctx._source.get(params.tsv).samples.remove(removeIdx);
+      merged.putAll(params.sample);
+      ctx._source.get(params.tsv).samples.add(merged);
+   } else {
+      ctx._source.get(params.tsv).samples.add(params.sample);
+   }
+}
+"""
+
 UPDATE_TSV_SCRIPT = """
 if (!ctx._source.containsKey(params.tsv)) {
    ctx._source.put(params.tsv, [params.row]);
 } else {
    // If this time series value already exists, add the new row to it
-
-   // TODO: Maybe do merging like for UPDATE_SAMPLES_SCRIPT, as there
-   // could potentially be multiple data points with the same participant
-   // id and time series value?
    ctx._source.get(params.tsv).add(params.row);
 }
 """
@@ -193,6 +215,43 @@ def _sample_scripts_by_id_from_export(
         }
 
 
+def _sample_tsv_scripts_by_id_from_export(
+        storage_client, bucket_name, export_obj_prefix, table_name,
+        participant_id_column, sample_id_column, sample_file_columns,
+        time_series_column):
+    for row in _rows_from_export(storage_client, bucket_name,
+                                 export_obj_prefix):
+        participant_id = row[participant_id_column]
+        del row[participant_id_column]
+        tsv = row[time_series_column]
+        row = {
+            '%s.%s' % (table_name, k) if k != sample_id_column else k: v
+            for k, v in row.iteritems()
+        }
+
+        # Use the sample_file_columns configuration to add the internal
+        # '_has_<sample_file_type>' fields to the samples index.
+        for file_type, col in sample_file_columns.iteritems():
+            # Only mark as false if this sample file column is relevant to the
+            # table currently being indexed.
+            if table_name in col:
+                has_name = '_has_%s' % file_type.lower().replace(" ", "_")
+                if col in row and row[col]:
+                    row[has_name] = True
+                else:
+                    row[has_name] = False
+
+        script = UPDATE_SAMPLES_TSV_SCRIPT % (sample_id_column, sample_id_column)
+        yield participant_id, {
+            'source': script,
+            'lang': 'painless',
+            'params': {
+                'tsv': tsv,
+                'sample': row
+            }
+        }
+
+
 def _docs_by_id_from_export(storage_client, bucket_name, export_obj_prefix,
                             table_name, participant_id_column):
     for row in _rows_from_export(storage_client, bucket_name,
@@ -282,10 +341,16 @@ def index_table(es, bq_client, storage_client, index_name, table,
     # Wait up to 10 minutes for the resulting export files to be created.
     job.result(timeout=600)
     if sample_id_column in [f.name for f in table.schema]:
-        # TODO: Do time series case
-        scripts_by_id = _sample_scripts_by_id_from_export(
-            storage_client, bucket_name, export_obj_prefix, table_name,
-            participant_id_column, sample_id_column, sample_file_columns)
+        if time_series_column:
+            assert time_series_column in [f.name for f in table.schema]
+            scripts_by_id = _sample_tsv_scripts_by_id_from_export(
+                storage_client, bucket_name, export_obj_prefix, table_name,
+                participant_id_column, sample_id_column, sample_file_columns,
+                time_series_column)
+        else:
+            scripts_by_id = _sample_scripts_by_id_from_export(
+                storage_client, bucket_name, export_obj_prefix, table_name,
+                participant_id_column, sample_id_column, sample_file_columns)
         indexer_util.bulk_index_scripts(es, index_name, scripts_by_id)
     else:
         if time_series_column:
@@ -403,10 +468,6 @@ def create_mappings(es, index_name, table_name, fields, participant_id_column,
     # By default, Elasticsearch dynamically determines mappings while it ingests data.
     # Instead, we tell Elasticsearch the mappings before ingesting data; and we turn
     # dynamic mapping to false. For large datasets, this dramatically speeds up indexing.
-
-    # TODO: Make sure put_mapping doesn't modify mappings, and make a separate
-    # case for having no time_series_column.
-
     if time_series_column:
         properties = {}
         mappings = {'dynamic': False,
