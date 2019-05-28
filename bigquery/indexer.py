@@ -41,6 +41,19 @@ if (!ctx._source.containsKey('samples')) {
 }
 """
 
+UPDATE_TSV_SCRIPT = """
+if (!ctx._source.containsKey(params.tsv)) {
+   ctx._source.put(params.tsv, [params.row]);
+} else {
+   // If this time series value already exists, add the new row to it
+
+   // TODO: Maybe do merging like for UPDATE_SAMPLES_SCRIPT, as there
+   // could potentially be multiple data points with the same participant
+   // id and time series value?
+   ctx._source.get(params.tsv).add(params.row);
+}
+"""
+
 
 # Copied from https://stackoverflow.com/a/45392259
 def _environ_or_required(key):
@@ -63,6 +76,16 @@ def _parse_args():
         help='Directory containing config files. Can be relative or absolute.',
         default=os.environ.get('DATASET_CONFIG_DIR'))
     return parser.parse_args()
+
+
+def get_time_series_vals(bq_client, time_series_column, table_name):
+    if not time_series_column:
+        return []
+
+    sql = 'SELECT DISTINCT %s from `%s`' % (time_series_column, table_name)
+    query_job = bq_client.query(sql)
+    query_job.result()
+    return [row[time_series_column] for row in query_job]
 
 
 def _table_name_from_table(table):
@@ -180,6 +203,27 @@ def _docs_by_id_from_export(storage_client, bucket_name, export_obj_prefix,
         yield participant_id, row
 
 
+def _tsv_scripts_by_id_from_export(storage_client, bucket_name,
+                                         export_obj_prefix, table_name,
+                                         participant_id_column,
+                                         time_series_column):
+    for row in _rows_from_export(storage_client, bucket_name,
+                                 export_obj_prefix):
+        participant_id = row[participant_id_column]
+        del row[participant_id_column]
+        tsv = row[time_series_column]
+        row = {'%s.%s' % (table_name, k): v for k, v in row.iteritems()}
+        script = UPDATE_TSV_SCRIPT
+        yield participant_id, {
+            'source': script,
+            'lang': 'painless',
+            'params': {
+                'tsv': tsv,
+                'row': row
+            }
+        }
+
+
 def _create_table_from_view(bq_client, view):
     # Creates a table named {}_copy that is a copy of view into
     # dataset 'dataset_for_view_exports'.
@@ -207,7 +251,7 @@ def _create_table_from_view(bq_client, view):
 
 def index_table(es, bq_client, storage_client, index_name, table,
                 participant_id_column, sample_id_column, sample_file_columns,
-                deploy_project_id):
+                time_series_column, deploy_project_id):
     table_name = _table_name_from_table(table)
     bucket_name = '%s-table-export' % deploy_project_id
     table_export_bucket = storage_client.lookup_bucket(bucket_name)
@@ -238,15 +282,23 @@ def index_table(es, bq_client, storage_client, index_name, table,
     # Wait up to 10 minutes for the resulting export files to be created.
     job.result(timeout=600)
     if sample_id_column in [f.name for f in table.schema]:
+        # TODO: Do time series case
         scripts_by_id = _sample_scripts_by_id_from_export(
             storage_client, bucket_name, export_obj_prefix, table_name,
             participant_id_column, sample_id_column, sample_file_columns)
         indexer_util.bulk_index_scripts(es, index_name, scripts_by_id)
     else:
-        docs_by_id = _docs_by_id_from_export(storage_client, bucket_name,
-                                             export_obj_prefix, table_name,
-                                             participant_id_column)
-        indexer_util.bulk_index_docs(es, index_name, docs_by_id)
+        if time_series_column:
+            assert time_series_column in [f.name for f in table.schema]
+            scripts_by_id = _tsv_scripts_by_id_from_export(
+                storage_client, bucket_name, export_obj_prefix, table_name,
+                participant_id_column, time_series_column)
+            indexer_util.bulk_index_scripts(es, index_name, scripts_by_id)
+        else:
+            docs_by_id = _docs_by_id_from_export(storage_client, bucket_name,
+                                                 export_obj_prefix, table_name,
+                                                 participant_id_column)
+            indexer_util.bulk_index_docs(es, index_name, docs_by_id)
 
     if table_is_view:
         # Delete the temporary copy table we created
@@ -346,12 +398,27 @@ def _get_has_file_field_name(field_name, sample_file_columns):
 
 
 def create_mappings(es, index_name, table_name, fields, participant_id_column,
-                    sample_id_column, sample_file_columns):
+                    sample_id_column, sample_file_columns, time_series_column,
+                    time_series_vals):
     # By default, Elasticsearch dynamically determines mappings while it ingests data.
     # Instead, we tell Elasticsearch the mappings before ingesting data; and we turn
     # dynamic mapping to false. For large datasets, this dramatically speeds up indexing.
-    mappings = {'dynamic': False, 'properties': {}}
-    properties = mappings['properties']
+
+    # TODO: Make sure put_mapping doesn't modify mappings, and make a separate
+    # case for having no time_series_column.
+
+    if time_series_column:
+        properties = {}
+        mappings = {'dynamic': False,
+                    'properties': {
+                        tsv: {'type': 'nested',
+                              'properties': properties} for tsv in time_series_vals
+                    }
+        }
+    else:
+        mappings = {'dynamic': False, 'properties': {}}
+        properties = mappings['properties']
+
     is_samples_table = False
     for field in fields:
         if field.name == sample_id_column:
@@ -383,7 +450,7 @@ def create_mappings(es, index_name, table_name, fields, participant_id_column,
         if es_field_type == 'nested' or es_field_type == 'object':
             inner_mappings = create_mappings(
                 es, index_name, field.fields, participant_id_column,
-                sample_id_column, sample_file_columns)
+                sample_id_column, sample_file_columns, time_series_column, time_series_vals)
             properties[field_name]['properties'] = inner_mappings['properties']
         elif es_field_type == 'text':
             properties[field_name]['fields'] = {
@@ -492,18 +559,22 @@ def main():
     participant_id_column = bigquery_config['participant_id_column']
     sample_id_column = bigquery_config.get('sample_id_column', None)
     sample_file_columns = bigquery_config.get('sample_file_columns', {})
+    time_series_column = bigquery_config.get('time_series_column', None)
     bq_client = bigquery.Client(project=deploy_project_id)
     storage_client = storage.Client(project=deploy_project_id)
 
     for table_name in bigquery_config['table_names']:
         table = read_table(bq_client, table_name)
+        time_series_vals = get_time_series_vals(bq_client, time_series_column,
+                                                table_name)
         index_fields(es, fields_index_name, table, sample_id_column)
         create_mappings(es, index_name, table_name, table.schema,
                         participant_id_column, sample_id_column,
-                        sample_file_columns)
+                        sample_file_columns, time_series_column,
+                        time_series_vals)
         index_table(es, bq_client, storage_client, index_name, table,
                     participant_id_column, sample_id_column,
-                    sample_file_columns, deploy_project_id)
+                    sample_file_columns, time_series_column, deploy_project_id)
 
     # Ensure all of the newly indexed documents are loaded into ES.
     time.sleep(5)
