@@ -41,6 +41,7 @@ if (!ctx._source.containsKey('samples')) {
 }
 """
 
+# TODO: Update both TSV scripts to invert nesting
 UPDATE_SAMPLES_TSV_SCRIPT = """
 if (!ctx._source.containsKey(params.tsv)) {
    ctx._source.put(params.tsv, new HashMap());
@@ -67,12 +68,21 @@ else if (!ctx._source.get(params.tsv).containsKey('samples')) {
 }
 """
 
+# UPDATE_TSV_SCRIPT = """
+# if (!ctx._source.containsKey(params.tsv)) {
+#    ctx._source.put(params.tsv, [params.row]);
+# } else {
+#    // If this time series value already exists, add the new row to it
+#    ctx._source.get(params.tsv).add(params.row);
+# }
+# """
+
 UPDATE_TSV_SCRIPT = """
-if (!ctx._source.containsKey(params.tsv)) {
-   ctx._source.put(params.tsv, [params.row]);
-} else {
-   // If this time series value already exists, add the new row to it
-   ctx._source.get(params.tsv).add(params.row);
+for (Map.Entry entry : params.entrySet()) {
+   if (!ctx._source.containsKey(entry.getKey())) {
+      ctx._source.put(entry.getKey(), new HashMap());
+   }
+   ctx._source.get(entry.getKey()).put(params.tsv, entry.getValue());
 }
 """
 
@@ -462,23 +472,27 @@ def _get_has_file_field_name(field_name, sample_file_columns):
     return ''
 
 
+def _add_field_to_mapping(properties, field_name, entry, time_series_column,
+                          time_series_vals):
+    if time_series_column:
+        properties[field_name] = {
+            'type': 'nested',
+            'properties': {
+                tsv: entry for tsv in time_series_vals
+            }
+        }
+    else:
+        properties[field_name] = entry
+
+
 def create_mappings(es, index_name, table_name, fields, participant_id_column,
                     sample_id_column, sample_file_columns, time_series_column,
                     time_series_vals):
     # By default, Elasticsearch dynamically determines mappings while it ingests data.
     # Instead, we tell Elasticsearch the mappings before ingesting data; and we turn
     # dynamic mapping to false. For large datasets, this dramatically speeds up indexing.
-    if time_series_column:
-        properties = {}
-        mappings = {'dynamic': False,
-                    'properties': {
-                        tsv: {'type': 'nested',
-                              'properties': properties} for tsv in time_series_vals
-                    }
-        }
-    else:
-        mappings = {'dynamic': False, 'properties': {}}
-        properties = mappings['properties']
+    mappings = {'dynamic': False, 'properties': {}}
+    properties = mappings['properties']
 
     is_samples_table = False
     for field in fields:
@@ -506,7 +520,7 @@ def create_mappings(es, index_name, table_name, fields, participant_id_column,
                 continue
 
         es_field_type = _get_es_field_type(field.field_type, field.mode)
-        properties[field_name] = {'type': es_field_type}
+        entry = {}
 
         if es_field_type == 'nested' or es_field_type == 'object':
             inner_mappings = create_mappings(
@@ -514,24 +528,33 @@ def create_mappings(es, index_name, table_name, fields, participant_id_column,
                 sample_id_column, sample_file_columns, time_series_column, time_series_vals)
             properties[field_name]['properties'] = inner_mappings['properties']
         elif es_field_type == 'text':
-            properties[field_name]['fields'] = {
-                'keyword': {
-                    'type': 'keyword',
-                    'ignore_above': 256
+            entry = {
+                'type': es_field_type,
+                # Use simple analyzer so underscores are treated as a word delimiter.
+                # Underscores in BQ column contents are not as common as underscores in column names, but
+                # some datasets have them (such as Baseline).
+                'analyzer': 'simple',
+                'fields': {
+                    'keyword': {
+                        'type': 'keyword',
+                        'ignore_above': 256
+                    }
                 }
             }
-            # Use simple analyzer so underscores are treated as a word delimiter.
-            # Underscores in BQ column contents are not as common as underscores in column names, but
-            # some datasets have them (such as Baseline).
-            properties[field_name]['analyzer'] = 'simple'
         elif es_field_type == 'date':
-            properties[field_name] = _get_datetime_formatted_string(
-                field.field_type)
+            entry = _get_datetime_formatted_string(field.field_type)
+        else:
+            entry = {'type': es_field_type}
+
+        if entry:
+            _add_field_to_mapping(properties, field_name, entry,
+                                  time_series_column, time_series_vals)
 
         has_field_name = _get_has_file_field_name(field_name,
                                                   sample_file_columns)
         if has_field_name:
-            properties[has_field_name] = {'type': 'boolean'}
+            _add_field_to_mapping(properties, field_name, {'type': 'boolean'},
+                                  time_series_column, time_series_vals)
 
     es.indices.put_mapping(doc_type='type', index=index_name, body=mappings)
 
