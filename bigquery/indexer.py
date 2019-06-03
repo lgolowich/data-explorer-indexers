@@ -42,43 +42,66 @@ if (!ctx._source.containsKey('samples')) {
 """
 
 # TODO: Update both TSV scripts to invert nesting
+# UPDATE_SAMPLES_TSV_SCRIPT = """
+# if (!ctx._source.containsKey(params.tsv)) {
+#    ctx._source.put(params.tsv, new HashMap());
+#    ctx._source.get(params.tsv).samples = [params.sample]
+# }
+# else if (!ctx._source.get(params.tsv).containsKey('samples')) {
+#    ctx._source.get(params.tsv).samples = [params.sample]
+# } else {
+#    // If this sample already exists, merge it with the new one.
+#    int removeIdx = -1;
+#    for (int i = 0; i < ctx._source.get(params.tsv).samples.size(); i++) {
+#       if (ctx._source.get(params.tsv).samples.get(i).get('%s').equals(params.sample.get('%s'))) {
+#          removeIdx = i;
+#       }
+#    }
+
+#    if (removeIdx >= 0) {
+#       Map merged = ctx._source.get(params.tsv).samples.remove(removeIdx);
+#       merged.putAll(params.sample);
+#       ctx._source.get(params.tsv).samples.add(merged);
+#    } else {
+#       ctx._source.get(params.tsv).samples.add(params.sample);
+#    }
+# }
+# """
+
 UPDATE_SAMPLES_TSV_SCRIPT = """
-if (!ctx._source.containsKey(params.tsv)) {
-   ctx._source.put(params.tsv, new HashMap());
-   ctx._source.get(params.tsv).samples = [params.sample]
-}
-else if (!ctx._source.get(params.tsv).containsKey('samples')) {
-   ctx._source.get(params.tsv).samples = [params.sample]
+if (!ctx._source.containsKey('samples')) {
+   Map cur_sample = new HashMap();
+
+   for (Map.Entry entry : params.sample.entrySet()) {
+      if (!ctx._source.containsKey(entry.getKey())) {
+         ctx._source.put(entry.getKey(), new HashMap());
+      }
+      ctx._source.get(entry.getKey()).put(params.tsv, entry.getValue());
+   }
+
+   ctx._source.samples = [cur_sample]
+
 } else {
    // If this sample already exists, merge it with the new one.
    int removeIdx = -1;
-   for (int i = 0; i < ctx._source.get(params.tsv).samples.size(); i++) {
-      if (ctx._source.get(params.tsv).samples.get(i).get('%s').equals(params.sample.get('%s'))) {
+   for (int i = 0; i < ctx._source.samples.size(); i++) {
+      if (ctx._source.samples.get(i).get('%s').equals(params.sample.get('%s'))) {
          removeIdx = i;
       }
    }
 
    if (removeIdx >= 0) {
-      Map merged = ctx._source.get(params.tsv).samples.remove(removeIdx);
+      Map merged = ctx._source.samples.remove(removeIdx);
       merged.putAll(params.sample);
-      ctx._source.get(params.tsv).samples.add(merged);
+      ctx._source.samples.add(merged);
    } else {
-      ctx._source.get(params.tsv).samples.add(params.sample);
+      ctx._source.samples.add(params.sample);
    }
 }
 """
 
-# UPDATE_TSV_SCRIPT = """
-# if (!ctx._source.containsKey(params.tsv)) {
-#    ctx._source.put(params.tsv, [params.row]);
-# } else {
-#    // If this time series value already exists, add the new row to it
-#    ctx._source.get(params.tsv).add(params.row);
-# }
-# """
-
 UPDATE_TSV_SCRIPT = """
-for (Map.Entry entry : params.entrySet()) {
+for (Map.Entry entry : params.row.entrySet()) {
    if (!ctx._source.containsKey(entry.getKey())) {
       ctx._source.put(entry.getKey(), new HashMap());
    }
@@ -553,7 +576,7 @@ def create_mappings(es, index_name, table_name, fields, participant_id_column,
         has_field_name = _get_has_file_field_name(field_name,
                                                   sample_file_columns)
         if has_field_name:
-            _add_field_to_mapping(properties, field_name, {'type': 'boolean'},
+            _add_field_to_mapping(properties, has_field_name, {'type': 'boolean'},
                                   time_series_column, time_series_vals)
 
     es.indices.put_mapping(doc_type='type', index=index_name, body=mappings)
