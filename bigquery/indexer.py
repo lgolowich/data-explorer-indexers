@@ -287,6 +287,7 @@ def _tsv_scripts_by_id_from_export(storage_client, bucket_name,
         participant_id = row[participant_id_column]
         del row[participant_id_column]
         tsv = row[time_series_column]
+        del row[time_series_column]
         row = {'%s.%s' % (table_name, k): v for k, v in row.iteritems()}
         script = UPDATE_TSV_SCRIPT
         yield participant_id, {
@@ -482,7 +483,7 @@ def _add_field_to_mapping(properties, field_name, entry, time_series_column,
                           time_series_vals):
     if time_series_column:
         properties[field_name] = {
-            'type': 'nested',
+            'type': 'object',
             'properties': {
                 tsv: entry for tsv in time_series_vals
             }
@@ -655,16 +656,20 @@ def main():
 
     for table_name in bigquery_config['table_names']:
         table = read_table(bq_client, table_name)
-        time_series_vals = get_time_series_vals(bq_client, time_series_column,
+        if time_series_column in [field.name for field in table.schema]:
+            table_tsc = time_series_column
+        else:
+            table_tsc = ""
+        time_series_vals = get_time_series_vals(bq_client, table_tsc,
                                                 table_name)
         index_fields(es, fields_index_name, table, sample_id_column)
         create_mappings(es, index_name, table_name, table.schema,
                         participant_id_column, sample_id_column,
-                        sample_file_columns, time_series_column,
+                        sample_file_columns, table_tsc,
                         time_series_vals)
         index_table(es, bq_client, storage_client, index_name, table,
                     participant_id_column, sample_id_column,
-                    sample_file_columns, time_series_column, deploy_project_id)
+                    sample_file_columns, table_tsc, deploy_project_id)
 
     # Ensure all of the newly indexed documents are loaded into ES.
     time.sleep(5)
