@@ -59,6 +59,7 @@ if (ctx._source.containsKey('samples')) {
       for (Map.Entry entry : params.sample.entrySet()) {
          if (!merged.containsKey(entry.getKey())) {
             merged.put(entry.getKey(), new HashMap());
+            merged.get(entry.getKey()).put('_is_time_series', true);
          }
          merged.get(entry.getKey()).put(params.tsv, entry.getValue());
       }
@@ -71,6 +72,7 @@ if (!sample_exists) {
 
    for (Map.Entry entry : params.sample.entrySet()) {
       cur_sample.put(entry.getKey(), new HashMap());
+      cur_sample.get(entry.getKey()).put('_is_time_series', true);
       cur_sample.get(entry.getKey()).put(params.tsv, entry.getValue());
    }
 
@@ -86,6 +88,7 @@ UPDATE_TSV_SCRIPT = """
 for (Map.Entry entry : params.row.entrySet()) {
    if (!ctx._source.containsKey(entry.getKey())) {
       ctx._source.put(entry.getKey(), new HashMap());
+      ctx._source.get(entry.getKey()).put('_is_time_series', true);
    }
    ctx._source.get(entry.getKey()).put(params.tsv, entry.getValue());
 }
@@ -488,6 +491,10 @@ def _add_field_to_mapping(properties, field_name, entry, time_series_column,
                 tsv: entry for tsv in time_series_vals
             }
         }
+        # _is_time_series should only ever be set to true; its
+        # existence in the mapping is used by the data explorer to
+        # determine which fields have time series data
+        properties[field_name]['properties']['_is_time_series'] = {'type': 'boolean'}
     else:
         properties[field_name] = entry
 
