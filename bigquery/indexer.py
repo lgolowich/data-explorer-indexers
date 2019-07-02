@@ -570,6 +570,8 @@ def create_mappings(es, index_name, table_name, fields, participant_id_column,
             _add_field_to_mapping(properties, has_field_name, {'type': 'boolean'},
                                   time_series_column, time_series_vals)
 
+    # Default limit on total number of fields is too small for some datasets.
+    es.indices.put_settings({"index.mapping.total_fields.limit": 100000})
     es.indices.put_mapping(doc_type='type', index=index_name, body=mappings)
 
 
