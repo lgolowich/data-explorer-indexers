@@ -41,49 +41,6 @@ if (!ctx._source.containsKey('samples')) {
 }
 """
 
-UPDATE_SAMPLES_TSV_SCRIPT = """
-boolean sample_exists = false;
-
-if (ctx._source.containsKey('samples')) {
-   int removeIdx = -1;
-   for (int i = 0; i < ctx._source.samples.size(); i++) {
-      if (ctx._source.samples.get(i).get('%s').equals(params.sample.get('%s'))) {
-         removeIdx = i;
-      }
-   }
-
-   if (removeIdx >= 0) {
-      // If this sample already exists, merge it with the new one.
-      sample_exists = true;
-      Map merged = ctx._source.samples.remove(removeIdx);
-      for (Map.Entry entry : params.sample.entrySet()) {
-         if (!merged.containsKey(entry.getKey())) {
-            merged.put(entry.getKey(), new HashMap());
-            merged.get(entry.getKey()).put('_is_time_series', true);
-         }
-         merged.get(entry.getKey()).put(params.tsv, entry.getValue());
-      }
-      ctx._source.samples.add(merged);
-   }
-}
-
-if (!sample_exists) {
-   Map cur_sample = new HashMap();
-
-   for (Map.Entry entry : params.sample.entrySet()) {
-      cur_sample.put(entry.getKey(), new HashMap());
-      cur_sample.get(entry.getKey()).put('_is_time_series', true);
-      cur_sample.get(entry.getKey()).put(params.tsv, entry.getValue());
-   }
-
-   if (ctx._source.containsKey('samples')) {
-      ctx._source.samples.add(cur_sample);
-   } else {
-      ctx._source.samples = [cur_sample]
-   }
-}
-"""
-
 UPDATE_TSV_SCRIPT = """
 for (Map.Entry entry : params.row.entrySet()) {
    if (!ctx._source.containsKey(entry.getKey())) {
@@ -233,44 +190,6 @@ def _sample_scripts_by_id_from_export(
         }
 
 
-def _sample_tsv_scripts_by_id_from_export(
-        storage_client, bucket_name, export_obj_prefix, table_name,
-        participant_id_column, sample_id_column, sample_file_columns,
-        time_series_column):
-    for row in _rows_from_export(storage_client, bucket_name,
-                                 export_obj_prefix):
-        participant_id = row[participant_id_column]
-        del row[participant_id_column]
-        tsv = row[time_series_column]
-        del row[time_series_column]
-        row = {
-            '%s.%s' % (table_name, k) if k != sample_id_column else k: v
-            for k, v in row.iteritems()
-        }
-
-        # Use the sample_file_columns configuration to add the internal
-        # '_has_<sample_file_type>' fields to the samples index.
-        for file_type, col in sample_file_columns.iteritems():
-            # Only mark as false if this sample file column is relevant to the
-            # table currently being indexed.
-            if table_name in col:
-                has_name = '_has_%s' % file_type.lower().replace(" ", "_")
-                if col in row and row[col]:
-                    row[has_name] = True
-                else:
-                    row[has_name] = False
-
-        script = UPDATE_SAMPLES_TSV_SCRIPT % (sample_id_column, sample_id_column)
-        yield participant_id, {
-            'source': script,
-            'lang': 'painless',
-            'params': {
-                'tsv': tsv,
-                'sample': row
-            }
-        }
-
-
 def _docs_by_id_from_export(storage_client, bucket_name, export_obj_prefix,
                             table_name, participant_id_column):
     for row in _rows_from_export(storage_client, bucket_name,
@@ -361,16 +280,11 @@ def index_table(es, bq_client, storage_client, index_name, table,
     # Wait up to 10 minutes for the resulting export files to be created.
     job.result(timeout=600)
     if sample_id_column in [f.name for f in table.schema]:
-        if time_series_column:
-            assert time_series_column in [f.name for f in table.schema]
-            scripts_by_id = _sample_tsv_scripts_by_id_from_export(
-                storage_client, bucket_name, export_obj_prefix, table_name,
-                participant_id_column, sample_id_column, sample_file_columns,
-                time_series_column)
-        else:
-            scripts_by_id = _sample_scripts_by_id_from_export(
-                storage_client, bucket_name, export_obj_prefix, table_name,
-                participant_id_column, sample_id_column, sample_file_columns)
+        # Cannot have time series data for samples.
+        assert not time_series_column
+        scripts_by_id = _sample_scripts_by_id_from_export(
+            storage_client, bucket_name, export_obj_prefix, table_name,
+            participant_id_column, sample_id_column, sample_file_columns)
         indexer_util.bulk_index_scripts(es, index_name, scripts_by_id)
     else:
         if time_series_column:
