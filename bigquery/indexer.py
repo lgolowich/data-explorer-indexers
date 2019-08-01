@@ -95,13 +95,13 @@ def _table_name_from_table(table):
     return project_id + '.' + dataset_table_id
 
 
-def _field_docs_by_id(id_prefix, name_prefix, fields,
-                      participant_id_column, sample_id_column):
+def _field_docs_by_id(id_prefix, name_prefix, fields, participant_id_column,
+                      sample_id_column):
     # This method is recursive to handle nested fields (BigQuery RECORD columns).
     # For nested fields, field name includes all levels of nesting, eg "addresses.city".
     for field in fields:
         if (field.name == participant_id_column
-            or field.name == sample_id_column):
+                or field.name == sample_id_column):
             continue
         field_name = field.name
         field_id = field.name
@@ -599,8 +599,8 @@ def main():
         table = read_table(bq_client, table_name)
         time_series_vals = get_time_series_vals(bq_client, time_series_column,
                                                 table_name, table)
-        index_fields(es, fields_index_name, table,
-                     participant_id_column, sample_id_column)
+        index_fields(es, fields_index_name, table, participant_id_column,
+                     sample_id_column)
         create_mappings(es, index_name, table_name, table.schema,
                         participant_id_column, sample_id_column,
                         sample_file_columns, time_series_column,
